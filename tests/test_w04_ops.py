@@ -1,7 +1,9 @@
 """Offline tests for W4 deployment network-scope guards."""
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("w04_ops", ROOT / "deploy/w04_ops.py")
@@ -34,6 +36,35 @@ class IngressScopeTests(unittest.TestCase):
             with self.subTest(permission=permission):
                 with self.assertRaisesRegex(SystemExit, "non-IPv4 ingress"):
                     w04_ops.ingress_signature({"IpPermissions": [permission]})
+
+
+class DeploymentSecretsTests(unittest.TestCase):
+    def test_combines_protected_application_and_database_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app_file = root / "app.env"
+            db_file = root / "db.env"
+            app_file.write_text(
+                "REPORTER_TOKEN=reporter-test-token\n"
+                "OPERATOR_TOKEN=operator-test-token\n",
+                encoding="utf-8",
+            )
+            db_file.write_text(
+                "DB_HOST=db.example.invalid\n"
+                "DB_NAME=inspection\n"
+                "DB_USER=inspection\n"
+                "DB_PASSWORD=database-test-password\n",
+                encoding="utf-8",
+            )
+            app_file.chmod(0o600)
+            db_file.chmod(0o600)
+            with patch.object(w04_ops, "SECRET_FILE", app_file), \
+                    patch.object(w04_ops, "DATABASE_SECRET_FILE", db_file):
+                payload = w04_ops.load_secret_bytes()
+
+        self.assertIn(b"REPORTER_TOKEN=reporter-test-token", payload)
+        self.assertIn(b"DB_PASSWORD=database-test-password", payload)
+        self.assertEqual(payload.count(b"\n"), 6)
 
 
 if __name__ == "__main__":

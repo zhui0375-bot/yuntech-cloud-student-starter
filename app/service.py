@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """W3 supplied inspection-service prototype; extend routes in later Sprints."""
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
@@ -18,6 +19,12 @@ REQUIRED_EVENT_FIELDS = ("event_id", "device_id", "observed_at", "type")
 ALLOWED_EVENT_FIELDS = set(REQUIRED_EVENT_FIELDS) | {"note"}
 EVENT_TYPES = {"status", "anomaly", "test"}
 AUTH_FILE = Path("/etc/inspection/app.env")
+RDS_CA_FILE = "/etc/inspection/rds-ca.pem"
+DB_ENV_FIELDS = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
+
+
+class DatabaseUnavailable(Exception):
+    pass
 
 
 def read_tokens(path=None):
@@ -40,6 +47,135 @@ def read_tokens(path=None):
     operator = values.get("OPERATOR_TOKEN", "")
     configured = bool(reporter and operator and not hmac.compare_digest(reporter, operator))
     return {"reporter": reporter, "operator": operator}, configured
+
+
+def read_database_config(path=None):
+    if path is None:
+        values = {key: os.environ.get(key, "") for key in DB_ENV_FIELDS}
+    else:
+        values = {}
+        try:
+            for line in Path(path).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key in DB_ENV_FIELDS:
+                    values[key] = value
+        except OSError:
+            pass
+    return values if all(values.get(key) for key in DB_ENV_FIELDS) else None
+
+
+@contextmanager
+def database_connection(config):
+    try:
+        import psycopg2
+    except ImportError as error:
+        raise DatabaseUnavailable from error
+
+    connection = None
+    try:
+        connection = psycopg2.connect(
+            host=config["DB_HOST"],
+            dbname=config["DB_NAME"],
+            user=config["DB_USER"],
+            password=config["DB_PASSWORD"],
+            sslmode="verify-full",
+            sslrootcert=RDS_CA_FILE,
+            connect_timeout=5,
+        )
+        with connection:
+            yield connection
+    except psycopg2.Error as error:
+        raise DatabaseUnavailable from error
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def prepare_events_table(cursor):
+    cursor.execute(
+        "CREATE TABLE IF NOT EXISTS events ("
+        "event_id TEXT PRIMARY KEY, "
+        "device_id TEXT NOT NULL, "
+        "observed_at TEXT NOT NULL, "
+        "event_type TEXT NOT NULL, "
+        "note TEXT, "
+        "received_at TEXT NOT NULL)"
+    )
+
+
+def event_from_row(row):
+    event_id, device_id, observed_at, event_type, note, received_at = row
+    event = {
+        "event_id": event_id,
+        "device_id": device_id,
+        "observed_at": observed_at,
+        "type": event_type,
+        "received_at": received_at,
+    }
+    if note is not None:
+        event["note"] = note
+    return event
+
+
+def database_get_events(config):
+    with database_connection(config) as connection:
+        with connection.cursor() as cursor:
+            prepare_events_table(cursor)
+            cursor.execute(
+                "SELECT event_id, device_id, observed_at, event_type, note, received_at "
+                "FROM events ORDER BY received_at DESC, event_id LIMIT 50"
+            )
+            rows = cursor.fetchall()
+    return [event_from_row(row) for row in rows]
+
+
+def database_get_event(config, event_id):
+    with database_connection(config) as connection:
+        with connection.cursor() as cursor:
+            prepare_events_table(cursor)
+            cursor.execute(
+                "SELECT event_id, device_id, observed_at, event_type, note, received_at "
+                "FROM events WHERE event_id = %s",
+                (event_id,),
+            )
+            row = cursor.fetchone()
+    return event_from_row(row) if row is not None else None
+
+
+def database_create_event(config, event):
+    received_at = datetime.now(timezone.utc).isoformat(
+        timespec="microseconds").replace("+00:00", "Z")
+    with database_connection(config) as connection:
+        with connection.cursor() as cursor:
+            prepare_events_table(cursor)
+            cursor.execute(
+                "INSERT INTO events "
+                "(event_id, device_id, observed_at, event_type, note, received_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (event_id) DO NOTHING "
+                "RETURNING event_id, device_id, observed_at, event_type, note, received_at",
+                (event["event_id"], event["device_id"], event["observed_at"],
+                 event["type"], event.get("note"), received_at),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                return 201, event_from_row(row)
+            cursor.execute(
+                "SELECT event_id, device_id, observed_at, event_type, note, received_at "
+                "FROM events WHERE event_id = %s",
+                (event["event_id"],),
+            )
+            existing = cursor.fetchone()
+    if existing is None:
+        raise DatabaseUnavailable
+    stored_event = event_from_row(existing)
+    original_event = {key: value for key, value in stored_event.items() if key != "received_at"}
+    if original_event == event:
+        return 200, stored_event
+    return 409, None
 
 
 def validate_event(value):
@@ -76,6 +212,7 @@ def make_server(version_file, port=8080, auth_file=None):
         raise ValueError("version must contain the deployed 40-character Git commit SHA")
     started = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     tokens, auth_configured = read_tokens(auth_file)
+    database_config = read_database_config(auth_file)
     events = {}
     events_lock = threading.Lock()
 
@@ -121,7 +258,8 @@ def make_server(version_file, port=8080, auth_file=None):
             path = urlsplit(self.path).path
             if path == "/health":
                 self.send_json(200, {"status": "ok", "service": "inspection", "version": version,
-                                     "started_at": started, "auth_configured": auth_configured})
+                                     "started_at": started, "auth_configured": auth_configured,
+                                     "db_configured": database_config is not None})
                 return
             if path == "/":
                 data = DISPLAY_PAGE.encode("utf-8")
@@ -135,16 +273,30 @@ def make_server(version_file, port=8080, auth_file=None):
             if path == "/events":
                 if not self.require_role("operator"):
                     return
-                with events_lock:
-                    latest = list(events.values())[-50:][::-1]
+                if database_config is not None:
+                    try:
+                        latest = database_get_events(database_config)
+                    except DatabaseUnavailable:
+                        self.send_error_json(503, "database_unavailable", "database")
+                        return
+                else:
+                    with events_lock:
+                        latest = list(events.values())[-50:][::-1]
                 self.send_json(200, {"events": latest})
                 return
             if path.startswith("/events/"):
                 if not self.require_role("operator"):
                     return
                 event_id = path.removeprefix("/events/")
-                with events_lock:
-                    event = events.get(event_id)
+                if database_config is not None:
+                    try:
+                        event = database_get_event(database_config, event_id)
+                    except DatabaseUnavailable:
+                        self.send_error_json(503, "database_unavailable", "database")
+                        return
+                else:
+                    with events_lock:
+                        event = events.get(event_id)
                 if event is None:
                     self.send_error_json(404, "not_found", "event_id")
                 else:
@@ -178,6 +330,17 @@ def make_server(version_file, port=8080, auth_file=None):
             event, error = validate_event(value)
             if error:
                 self.send_json(400, error)
+                return
+            if database_config is not None:
+                try:
+                    status, stored_event = database_create_event(database_config, event)
+                except DatabaseUnavailable:
+                    self.send_error_json(503, "database_unavailable", "database")
+                    return
+                if status == 409:
+                    self.send_error_json(409, "event_id_conflict", "event_id")
+                    return
+                self.send_json(status, stored_event)
                 return
             with events_lock:
                 if event["event_id"] in events:

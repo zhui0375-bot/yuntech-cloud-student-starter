@@ -21,6 +21,7 @@ REGION = "us-east-1"
 EXPECTED_TAGS = {"course": "yuntech-115-1", "week": "w03", "group": "group5", "owner": "ww"}
 RESOURCE_FILE = ROOT / ".local" / "resources.json"
 SECRET_FILE = ROOT / ".local" / "app.env"
+DATABASE_SECRET_FILE = ROOT / ".local" / "db.env"
 
 
 def context():
@@ -178,21 +179,31 @@ Security Group：{value['security_group_id']}；Key pair：{value['key_pair_id']
 
 
 def load_secret_bytes():
-    if not SECRET_FILE.is_file() or stat.S_IMODE(SECRET_FILE.stat().st_mode) != 0o600:
-        raise SystemExit(".local/app.env must exist with mode 600; token contents are never displayed")
-    payload = SECRET_FILE.read_bytes()
+    files = (
+        (SECRET_FILE, {"REPORTER_TOKEN", "OPERATOR_TOKEN"}),
+        (DATABASE_SECRET_FILE, {"DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"}),
+    )
+    payloads = []
     values = {}
-    try:
-        for line in payload.decode("utf-8").splitlines():
+    for path, allowed_keys in files:
+        if not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o600:
+            raise SystemExit(f"{path.name} must exist with mode 600; secret contents are never displayed")
+        payload = path.read_bytes()
+        try:
+            lines = payload.decode("utf-8").splitlines()
+        except UnicodeDecodeError as error:
+            raise SystemExit(f"{path.name} is not valid UTF-8; secret contents withheld") from error
+        for line in lines:
             key, separator, value = line.partition("=")
-            if separator and key in {"REPORTER_TOKEN", "OPERATOR_TOKEN"}:
+            if separator and key in allowed_keys:
                 values[key] = value
-    except UnicodeDecodeError as error:
-        raise SystemExit("app.env is not valid UTF-8; token contents withheld") from error
+        payloads.append(payload.rstrip(b"\n"))
     reporter, operator = values.get("REPORTER_TOKEN", ""), values.get("OPERATOR_TOKEN", "")
     if not reporter or not operator or secrets.compare_digest(reporter, operator):
         raise SystemExit("app.env must contain two distinct non-empty tokens; contents withheld")
-    return payload
+    if not all(values.get(key) for key in {"DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"}):
+        raise SystemExit("db.env must contain DB_HOST, DB_NAME, DB_USER and DB_PASSWORD")
+    return b"\n".join(payloads) + b"\n"
 
 
 def run_ssh(public_ip, key_path, remote_command, data=None):
@@ -230,11 +241,12 @@ def deploy(args):
     if not key_path.is_file() or stat.S_IMODE(key_path.stat().st_mode) != 0o600:
         raise SystemExit("SSH private key is missing or mode is not 600")
 
-    description = f"""W4 T3 將部署到既有主機：
+    description = f"""W5 T3 將部署到既有主機：
 EC2：{value['instance_id']}，目前 public IPv4：{public_ip}，group5/ww 標籤已核對
+RDS：只讀取 .local/db.env 的連線設定；不新增或修改 RDS。
 Commit：{commit}
 網路：TCP 22/80 維持既有 {source}/32；不改 SG、不建立資源。
-秘密：.local/app.env 權限 600，僅經 SSH stdin 寫到 root:600 的 /etc/inspection/app.env；不進 user data、命令列或輸出。
+秘密：.local/app.env 與 .local/db.env 權限 600，僅經 SSH stdin 寫到 root:600 的 /etc/inspection/app.env；不進 user data、命令列或輸出。
 費用：無新 AWS 資源；主機運行期間仍有 t3.micro、公有 IPv4 與 8 GiB gp3 的既有費用。
 確認後用 StrictHostKeyChecking=accept-new 記錄新位址指紋，安裝、注入秘密、重啟服務並驗證 health/auth_configured。
 回復：停止同一 instance；服務檔可由上一個已 commit 版本重新部署。"""
@@ -242,7 +254,8 @@ Commit：{commit}
 
     with tempfile.TemporaryDirectory(prefix="w04-user-data-") as directory:
         user_data = Path(directory) / "install.sh"
-        subprocess.run(["bash", str(ROOT / "deploy" / "make-user-data.sh"), commit, str(user_data)],
+        subprocess.run([sys.executable, str(ROOT / "deploy" / "make_user_data.py"),
+                        commit, str(user_data)],
                        cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         run_ssh(public_ip, key_path, "sudo bash -s", user_data.read_bytes())
     install_secret = (
@@ -256,7 +269,7 @@ Commit：{commit}
     value["commit"] = commit
     write_resources(value)
     health(public_ip, commit, require_auth=True)
-    print(f"W4 deploy complete; host={public_ip}; commit={commit}; token contents withheld")
+    print(f"W5 deploy complete; host={public_ip}; commit={commit}; secret contents withheld")
 
 
 def main():
