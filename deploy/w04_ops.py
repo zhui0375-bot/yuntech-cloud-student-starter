@@ -21,9 +21,11 @@ REGION = "us-east-1"
 EXPECTED_TAGS = {"course": "yuntech-115-1", "week": "w03", "group": "group5", "owner": "ww"}
 RESOURCE_FILE = ROOT / ".local" / "resources.json"
 SECRET_FILE = ROOT / ".local" / "app.env"
+DATABASE_SECRET_FILE = ROOT / ".local" / "db.env"
 IOT_DIR = ROOT / ".local" / "iot"
 IOT_CODE = "group5-ww"
 IOT_DEVICE_IDS = tuple(f"{IOT_CODE}-d{number:02d}" for number in range(1, 11))
+DB_ENV_FIELDS = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
 IOT_ENV_KEYS = {
     "IOT_ENDPOINT", "IOT_TOPIC", "IOT_CLIENT_ID", "IOT_DEVICE_IDS",
     "IOT_CA", "IOT_CERT", "IOT_KEY",
@@ -185,21 +187,41 @@ Security Group：{value['security_group_id']}；Key pair：{value['key_pair_id']
 
 
 def load_secret_bytes():
-    if not SECRET_FILE.is_file() or stat.S_IMODE(SECRET_FILE.stat().st_mode) != 0o600:
+    if ((ROOT / ".local").is_symlink() or SECRET_FILE.is_symlink()
+            or not SECRET_FILE.is_file() or stat.S_IMODE(SECRET_FILE.stat().st_mode) != 0o600):
         raise SystemExit(".local/app.env must exist with mode 600; token contents are never displayed")
-    payload = SECRET_FILE.read_bytes()
-    values = {}
     try:
-        for line in payload.decode("utf-8").splitlines():
-            key, separator, value = line.partition("=")
-            if separator and key in {"REPORTER_TOKEN", "OPERATOR_TOKEN"}:
-                values[key] = value
-    except UnicodeDecodeError as error:
-        raise SystemExit("app.env is not valid UTF-8; token contents withheld") from error
+        lines = SECRET_FILE.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise SystemExit(".local/app.env is unreadable; token contents are never displayed") from error
+    values = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator and key in {"REPORTER_TOKEN", "OPERATOR_TOKEN"}:
+            values[key] = value
     reporter, operator = values.get("REPORTER_TOKEN", ""), values.get("OPERATOR_TOKEN", "")
     if not reporter or not operator or secrets.compare_digest(reporter, operator):
         raise SystemExit("app.env must contain two distinct non-empty tokens; contents withheld")
-    return payload
+
+    if DATABASE_SECRET_FILE.exists() or DATABASE_SECRET_FILE.is_symlink():
+        if (DATABASE_SECRET_FILE.is_symlink() or not DATABASE_SECRET_FILE.is_file()
+                or stat.S_IMODE(DATABASE_SECRET_FILE.stat().st_mode) != 0o600):
+            raise SystemExit(".local/db.env must be a regular mode-600 file; database contents withheld")
+        try:
+            database_lines = DATABASE_SECRET_FILE.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as error:
+            raise SystemExit(".local/db.env is unreadable; database contents withheld") from error
+        database_values = {}
+        for line in database_lines:
+            key, separator, value = line.partition("=")
+            if separator and key in DB_ENV_FIELDS:
+                database_values[key] = value
+        if not all(database_values.get(key) for key in DB_ENV_FIELDS):
+            raise SystemExit(".local/db.env lacks required database settings; contents withheld")
+        lines = [line for line in lines if line.partition("=")[0] not in DB_ENV_FIELDS]
+        lines.extend(f"{key}={database_values[key]}" for key in DB_ENV_FIELDS)
+
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def load_iot_bundle(resources_value):
