@@ -131,24 +131,44 @@ def collect_remote(public_ip, key_path, prefix):
     deadline = time.monotonic() + 60
     latest = None
     while True:
-        output = w04_ops.run_ssh(
-            public_ip,
-            key_path,
-            remote_query(prefix),
-        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            latest_counts = ""
+            if latest is not None:
+                counts, database_count = latest
+                latest_counts = (
+                    f" (last counts: created={counts['created']} "
+                    f"duplicate={counts['duplicate']} rejected={counts['rejected']} "
+                    f"error={counts['error']} database={database_count})"
+                )
+            raise TimeoutError(
+                f"Consumer evidence did not reach 32 records within 60 seconds{latest_counts}"
+            )
+        try:
+            output = w04_ops.run_ssh(
+                public_ip,
+                key_path,
+                remote_query(prefix),
+                timeout=remaining,
+            )
+        except TimeoutError as error:
+            latest_counts = ""
+            if latest is not None:
+                counts, database_count = latest
+                latest_counts = (
+                    f" (last counts: created={counts['created']} "
+                    f"duplicate={counts['duplicate']} rejected={counts['rejected']} "
+                    f"error={counts['error']} database={database_count})"
+                )
+            raise TimeoutError(
+                f"Consumer evidence did not reach 32 records within 60 seconds{latest_counts}"
+            ) from error
         latest = parse_remote_output(output)
         if sum(latest[0].values()) >= 32:
             return latest
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            counts, database_count = latest
-            raise TimeoutError(
-                "Consumer evidence did not reach 32 records within 60 seconds "
-                f"(created={counts['created']} duplicate={counts['duplicate']} "
-                f"rejected={counts['rejected']} error={counts['error']} "
-                f"database={database_count})"
-            )
-        time.sleep(min(5, remaining))
+        if remaining > 0:
+            time.sleep(min(5, remaining))
 
 
 def get_filtered_events(public_ip, device_id, operator_token, prefix):

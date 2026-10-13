@@ -284,11 +284,16 @@ def install_iot_file(public_ip, key_path, name, content):
     run_ssh(public_ip, key_path, remote_command, content)
 
 
-def run_ssh(public_ip, key_path, remote_command, data=None):
+def run_ssh(public_ip, key_path, remote_command, data=None, timeout=90):
     command = ["ssh", "-i", str(key_path), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new",
                f"ec2-user@{public_ip}", remote_command]
-    result = subprocess.run(command, input=data, capture_output=True, timeout=90, check=False)
+    try:
+        result = subprocess.run(
+            command, input=data, capture_output=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError("SSH step timed out; output withheld") from error
     if result.returncode:
         raise SystemExit("SSH deployment step failed; output withheld")
     return result.stdout.decode("utf-8", errors="replace")

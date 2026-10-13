@@ -3,8 +3,10 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +98,27 @@ class ReconcileTests(unittest.TestCase):
         request = open_url.call_args.args[0]
         self.assertIn("device_id=group5-ww-d01", request.full_url)
         self.assertEqual(request.get_header("Authorization"), "Bearer placeholder-secret")
+
+
+    def test_remote_poll_passes_remaining_sixty_second_budget_to_ssh(self):
+        with patch.object(reconcile.time, "monotonic", side_effect=[100.0, 100.0]), \
+                patch.object(
+                    reconcile.w04_ops,
+                    "run_ssh",
+                    side_effect=TimeoutError("SSH step timed out; output withheld"),
+                ) as run_ssh:
+            with self.assertRaisesRegex(TimeoutError, "within 60 seconds"):
+                reconcile.collect_remote("192.0.2.10", Path("/tmp/key"), "group5-ww-r1")
+        self.assertEqual(run_ssh.call_args.kwargs["timeout"], 60)
+
+    def test_ssh_helper_accepts_an_explicit_timeout(self):
+        completed = SimpleNamespace(returncode=0, stdout=b"safe output")
+        with patch.object(reconcile.w04_ops.subprocess, "run", return_value=completed) as run:
+            result = reconcile.w04_ops.run_ssh(
+                "192.0.2.10", Path("/tmp/key"), "true", timeout=12
+            )
+        self.assertEqual(result, "safe output")
+        self.assertEqual(run.call_args.kwargs["timeout"], 12)
 
 
 if __name__ == "__main__":
