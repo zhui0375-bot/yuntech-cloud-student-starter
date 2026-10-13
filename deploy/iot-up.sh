@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -213,9 +215,34 @@ def ensure_certificate(role, resources_value):
     if cert_path.exists() or private_path.exists():
         stop(f"Unrecorded {role} certificate files already exist; refusing to overwrite or create another")
 
-    result = lab.run_aws(
-        ["iot", "create-keys-and-certificate", "--set-as-active"], REGION
-    )
+    descriptor, response_name = tempfile.mkstemp(prefix=".iot-certificate-", dir=IOT_DIR)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as response_file:
+            result = subprocess.run(
+                [
+                    "aws", "--profile", lab.PROFILE, "--region", REGION,
+                    "--no-cli-pager", "--output", "json",
+                    "iot", "create-keys-and-certificate", "--set-as-active",
+                ],
+                env=lab.clean_env(REGION),
+                stdout=response_file,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+        if result.returncode:
+            error = lab.error_code(result.stderr)
+            raise lab.LabError(f"iot create-keys-and-certificate: {error}. Stop and inspect before retrying.")
+        result = json.loads(Path(response_name).read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise lab.LabError("AWS CLI missing; open the devcontainer.") from error
+    except subprocess.TimeoutExpired as error:
+        raise lab.LabError("AWS certificate creation timed out; inspect before retrying.") from error
+    finally:
+        Path(response_name).unlink(missing_ok=True)
+
     certificate = result.get("certificatePem")
     private_key = result.get("keyPair", {}).get("PrivateKey")
     certificate_id = result.get("certificateId")
