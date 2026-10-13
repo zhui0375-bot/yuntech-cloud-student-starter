@@ -104,7 +104,7 @@ class MqttCheck:
 
     @staticmethod
     def reason_value(reason):
-        return int(reason)
+        return int(getattr(reason, "value", reason))
 
     def on_connect(self, _client, _userdata, _flags, reason_code, _properties):
         self.connection_reason = self.reason_value(reason_code)
