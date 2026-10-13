@@ -35,6 +35,27 @@ def safe_file(path, private=False):
     return path
 
 
+def reason_value(reason):
+    return int(getattr(reason, "value", reason))
+
+
+def make_client(settings):
+    client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        client_id=settings["client_id"],
+        protocol=mqtt.MQTTv5,
+        transport="tcp",
+    )
+    client.tls_set(
+        ca_certs=str(settings["ca"]),
+        certfile=str(settings["cert"]),
+        keyfile=str(settings["key"]),
+        cert_reqs=ssl.CERT_REQUIRED,
+        tls_version=ssl.PROTOCOL_TLS_CLIENT,
+    )
+    return client
+
+
 def load_settings(identity):
     if paho.mqtt.__version__ != EXPECTED_VERSION:
         raise ValueError(f"paho-mqtt {EXPECTED_VERSION} is required in the active Python environment")
@@ -84,30 +105,14 @@ class MqttCheck:
         self.subscription_mid = None
         self.publish_reasons = {}
         self.messages = []
-        self.client = mqtt.Client(
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id=settings["client_id"],
-            protocol=mqtt.MQTTv5,
-            transport="tcp",
-        )
-        self.client.tls_set(
-            ca_certs=str(settings["ca"]),
-            certfile=str(settings["cert"]),
-            keyfile=str(settings["key"]),
-            cert_reqs=ssl.CERT_REQUIRED,
-            tls_version=ssl.PROTOCOL_TLS_CLIENT,
-        )
+        self.client = make_client(settings)
         self.client.on_connect = self.on_connect
         self.client.on_subscribe = self.on_subscribe
         self.client.on_publish = self.on_publish
         self.client.on_message = self.on_message
 
-    @staticmethod
-    def reason_value(reason):
-        return int(getattr(reason, "value", reason))
-
     def on_connect(self, _client, _userdata, _flags, reason_code, _properties):
-        self.connection_reason = self.reason_value(reason_code)
+        self.connection_reason = reason_value(reason_code)
         print(f"connack={self.connection_reason}", flush=True)
         self.connected.set()
 
@@ -115,14 +120,14 @@ class MqttCheck:
         if self.subscription_mid is not None and mid != self.subscription_mid:
             return
         self.subscription_mid = mid
-        values = [self.reason_value(reason) for reason in reason_codes]
+        values = [reason_value(reason) for reason in reason_codes]
         self.subscription_reason = values[0] if values else 128
         print(f"suback={self.subscription_reason}", flush=True)
         self.subscribed.set()
 
     def on_publish(self, _client, _userdata, mid, reason_code, _properties):
         with self.condition:
-            self.publish_reasons[mid] = self.reason_value(reason_code)
+            self.publish_reasons[mid] = reason_value(reason_code)
             self.condition.notify_all()
 
     def on_message(self, _client, _userdata, message):
