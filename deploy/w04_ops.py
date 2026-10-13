@@ -21,7 +21,13 @@ REGION = "us-east-1"
 EXPECTED_TAGS = {"course": "yuntech-115-1", "week": "w03", "group": "group5", "owner": "ww"}
 RESOURCE_FILE = ROOT / ".local" / "resources.json"
 SECRET_FILE = ROOT / ".local" / "app.env"
-DATABASE_SECRET_FILE = ROOT / ".local" / "db.env"
+IOT_DIR = ROOT / ".local" / "iot"
+IOT_CODE = "group5-ww"
+IOT_DEVICE_IDS = tuple(f"{IOT_CODE}-d{number:02d}" for number in range(1, 11))
+IOT_ENV_KEYS = {
+    "IOT_ENDPOINT", "IOT_TOPIC", "IOT_CLIENT_ID", "IOT_DEVICE_IDS",
+    "IOT_CA", "IOT_CERT", "IOT_KEY",
+}
 
 
 def context():
@@ -179,31 +185,100 @@ Security Group：{value['security_group_id']}；Key pair：{value['key_pair_id']
 
 
 def load_secret_bytes():
-    files = (
-        (SECRET_FILE, {"REPORTER_TOKEN", "OPERATOR_TOKEN"}),
-        (DATABASE_SECRET_FILE, {"DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"}),
-    )
-    payloads = []
+    if not SECRET_FILE.is_file() or stat.S_IMODE(SECRET_FILE.stat().st_mode) != 0o600:
+        raise SystemExit(".local/app.env must exist with mode 600; token contents are never displayed")
+    payload = SECRET_FILE.read_bytes()
     values = {}
-    for path, allowed_keys in files:
-        if not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o600:
-            raise SystemExit(f"{path.name} must exist with mode 600; secret contents are never displayed")
-        payload = path.read_bytes()
-        try:
-            lines = payload.decode("utf-8").splitlines()
-        except UnicodeDecodeError as error:
-            raise SystemExit(f"{path.name} is not valid UTF-8; secret contents withheld") from error
-        for line in lines:
+    try:
+        for line in payload.decode("utf-8").splitlines():
             key, separator, value = line.partition("=")
-            if separator and key in allowed_keys:
+            if separator and key in {"REPORTER_TOKEN", "OPERATOR_TOKEN"}:
                 values[key] = value
-        payloads.append(payload.rstrip(b"\n"))
+    except UnicodeDecodeError as error:
+        raise SystemExit("app.env is not valid UTF-8; token contents withheld") from error
     reporter, operator = values.get("REPORTER_TOKEN", ""), values.get("OPERATOR_TOKEN", "")
     if not reporter or not operator or secrets.compare_digest(reporter, operator):
         raise SystemExit("app.env must contain two distinct non-empty tokens; contents withheld")
-    if not all(values.get(key) for key in {"DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"}):
-        raise SystemExit("db.env must contain DB_HOST, DB_NAME, DB_USER and DB_PASSWORD")
-    return b"\n".join(payloads) + b"\n"
+    return payload
+
+
+def load_iot_bundle(resources_value):
+    if ((ROOT / ".local").is_symlink() or IOT_DIR.is_symlink() or not IOT_DIR.is_dir()
+            or stat.S_IMODE(IOT_DIR.stat().st_mode) != 0o700):
+        raise SystemExit(".local/iot must exist as a mode-700 directory")
+    expected_policy_names = {
+        "iot_gw_policy": f"cxe-{IOT_CODE}-gw",
+        "iot_consumer_policy": f"cxe-{IOT_CODE}-consumer",
+    }
+    gateway_cert_id = resources_value.get("iot_gw_cert_id")
+    consumer_cert_id = resources_value.get("iot_consumer_cert_id")
+    if (not isinstance(gateway_cert_id, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", gateway_cert_id)
+            or not isinstance(consumer_cert_id, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", consumer_cert_id)
+            or any(resources_value.get(key) != name
+                   for key, name in expected_policy_names.items())):
+        raise SystemExit("resources.json is missing the expected W6 IoT identities")
+
+    file_paths = {
+        "AmazonRootCA1.pem": IOT_DIR / "AmazonRootCA1.pem",
+        "consumer.cert.pem": IOT_DIR / "consumer.cert.pem",
+        "consumer.private.key": IOT_DIR / "consumer.private.key",
+    }
+    contents = {}
+    for name, path in file_paths.items():
+        if (path.is_symlink() or not path.is_file()
+                or stat.S_IMODE(path.stat().st_mode) != 0o600):
+            raise SystemExit(f".local/iot/{name} must be a regular mode-600 file")
+        contents[name] = path.read_bytes()
+    endpoint_path = IOT_DIR / "endpoint"
+    if (endpoint_path.is_symlink() or not endpoint_path.is_file()
+            or stat.S_IMODE(endpoint_path.stat().st_mode) != 0o600):
+        raise SystemExit(".local/iot/endpoint must be a regular mode-600 file")
+    endpoint = endpoint_path.read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]+\.iot\.us-east-1\.amazonaws\.com", endpoint):
+        raise SystemExit(".local/iot/endpoint is not a valid us-east-1 endpoint")
+    if (b"-----BEGIN CERTIFICATE-----" not in contents["AmazonRootCA1.pem"]
+            or b"-----BEGIN CERTIFICATE-----" not in contents["consumer.cert.pem"]
+            or not (b"-----BEGIN RSA PRIVATE KEY-----" in contents["consumer.private.key"]
+                    or b"-----BEGIN PRIVATE KEY-----" in contents["consumer.private.key"])):
+        raise SystemExit("W6 consumer TLS material is not valid PEM; contents withheld")
+    return endpoint, contents
+
+
+def app_env_with_iot(payload, endpoint):
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise SystemExit(".local/app.env is not valid UTF-8; secret contents withheld") from error
+    lines = [
+        line for line in lines
+        if line.partition("=")[0] not in IOT_ENV_KEYS
+    ]
+    settings = {
+        "IOT_ENDPOINT": endpoint,
+        "IOT_TOPIC": f"cxe/{IOT_CODE}/gw/events",
+        "IOT_CLIENT_ID": f"consumer-{IOT_CODE}",
+        "IOT_DEVICE_IDS": ",".join(IOT_DEVICE_IDS),
+        "IOT_CA": "/etc/inspection/iot/AmazonRootCA1.pem",
+        "IOT_CERT": "/etc/inspection/iot/consumer.cert.pem",
+        "IOT_KEY": "/etc/inspection/iot/consumer.private.key",
+    }
+    lines.extend(f"{key}={value}" for key, value in settings.items())
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def install_iot_file(public_ip, key_path, name, content):
+    if name not in {"AmazonRootCA1.pem", "consumer.cert.pem", "consumer.private.key"}:
+        raise ValueError("Unsupported W6 IoT deployment file")
+    remote_path = f"/etc/inspection/iot/{name}"
+    remote_command = (
+        "sudo sh -c 'umask 077; "
+        "install -d -o inspection -g inspection -m 700 /etc/inspection/iot; "
+        f"cat > {remote_path}; "
+        f"chown inspection:inspection {remote_path}; chmod 600 {remote_path}'"
+    )
+    run_ssh(public_ip, key_path, remote_command, content)
 
 
 def run_ssh(public_ip, key_path, remote_command, data=None):
@@ -229,47 +304,57 @@ def deploy(args):
     if source != value["source"]:
         raise SystemExit(f"Codespace source changed: recorded {value['source']}, current {source}; obtain review before changing SG")
     secrets_payload = load_secret_bytes()
+    endpoint, iot_files = load_iot_bundle(value)
+    deployment_secrets = app_env_with_iot(secrets_payload, endpoint)
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "--end-of-options",
                                       args.commit + "^{commit}"], cwd=ROOT, text=True).strip()
-    if subprocess.run(["git", "diff", "--quiet", commit, "--", "app/service.py", "deploy/nginx.conf"],
+    deploy_files = ("app/service.py", "app/consumer.py", "deploy/nginx.conf")
+    if subprocess.run(["git", "diff", "--quiet", commit, "--", *deploy_files],
                       cwd=ROOT, check=False).returncode != 0:
-        raise SystemExit("app/service.py or deploy/nginx.conf has uncommitted changes; commit and review before deploy")
-    if subprocess.run(["git", "diff", "--cached", "--quiet", commit, "--", "app/service.py", "deploy/nginx.conf"],
+        raise SystemExit("An application file has uncommitted changes; commit and review before deploy")
+    if subprocess.run(["git", "diff", "--cached", "--quiet", commit, "--", *deploy_files],
                       cwd=ROOT, check=False).returncode != 0:
-        raise SystemExit("app/service.py or deploy/nginx.conf has staged changes outside the selected commit")
+        raise SystemExit("An application file has staged changes outside the selected commit")
     key_path = Path.home() / ".ssh" / "id_ed25519"
     if not key_path.is_file() or stat.S_IMODE(key_path.stat().st_mode) != 0o600:
         raise SystemExit("SSH private key is missing or mode is not 600")
 
-    description = f"""W5 T3 將部署到既有主機：
+    description = f"""W6 T3/ T4 將部署到既有主機：
 EC2：{value['instance_id']}，目前 public IPv4：{public_ip}，group5/ww 標籤已核對
-RDS：只讀取 .local/db.env 的連線設定；不新增或修改 RDS。
 Commit：{commit}
 網路：TCP 22/80 維持既有 {source}/32；不改 SG、不建立資源。
-秘密：.local/app.env 與 .local/db.env 權限 600，僅經 SSH stdin 寫到 root:600 的 /etc/inspection/app.env；不進 user data、命令列或輸出。
+IoT：安裝一張已核對的 consumer 憑證、私鑰與 Root CA 到 /etc/inspection/iot；目錄 inspection:inspection 700，檔案 600。
+秘密：合併 W6 IOT_ 設定後，.local/app.env 僅經 SSH stdin 寫到 root:600 的 /etc/inspection/app.env；本機與遠端內容不輸出。
 費用：無新 AWS 資源；主機運行期間仍有 t3.micro、公有 IPv4 與 8 GiB gp3 的既有費用。
-確認後用 StrictHostKeyChecking=accept-new 記錄新位址指紋，安裝、注入秘密、重啟服務並驗證 health/auth_configured。
-回復：停止同一 instance；服務檔可由上一個已 commit 版本重新部署。"""
+確認後用 StrictHostKeyChecking=accept-new 記錄位址指紋，僅向既有主機部署已 commit 程式與 secrets，重啟服務並驗證 health/auth_configured。
+回復：在同一主機重部署上一個已 commit 版本，並移除或替換 /etc/inspection/iot 下的 W6 憑證檔；不刪除 EC2/RDS/網路資源。"""
     lab.approve(description, "DEPLOY")
 
     with tempfile.TemporaryDirectory(prefix="w04-user-data-") as directory:
         user_data = Path(directory) / "install.sh"
-        subprocess.run([sys.executable, str(ROOT / "deploy" / "make_user_data.py"),
-                        commit, str(user_data)],
+        subprocess.run(["bash", str(ROOT / "deploy" / "make-user-data.sh"), commit, str(user_data)],
                        cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         run_ssh(public_ip, key_path, "sudo bash -s", user_data.read_bytes())
     install_secret = (
-        "sudo sh -c 'umask 077; install -d -o root -g root -m 700 /etc/inspection; "
+        "sudo sh -c 'umask 077; install -d -o root -g root -m 755 /etc/inspection; "
+        "chown root:root /etc/inspection; chmod 755 /etc/inspection; "
         "cat > /etc/inspection/app.env; chown root:root /etc/inspection/app.env; "
         "chmod 600 /etc/inspection/app.env'"
     )
-    run_ssh(public_ip, key_path, install_secret, secrets_payload)
-    run_ssh(public_ip, key_path, "sudo systemctl restart inspection.service")
+    for name, content in iot_files.items():
+        install_iot_file(public_ip, key_path, name, content)
+    run_ssh(public_ip, key_path, install_secret, deployment_secrets)
+    run_ssh(public_ip, key_path, "sudo systemctl restart inspection-consumer.service")
+    service_states = run_ssh(
+        public_ip, key_path, "systemctl is-active inspection.service inspection-consumer.service"
+    ).splitlines()
+    if service_states != ["active", "active"]:
+        raise SystemExit("Inspection services are not both active; remote status withheld")
     value["public_ip"] = public_ip
     value["commit"] = commit
     write_resources(value)
     health(public_ip, commit, require_auth=True)
-    print(f"W5 deploy complete; host={public_ip}; commit={commit}; secret contents withheld")
+    print(f"W6 deploy complete; host={public_ip}; commit={commit}; secret contents withheld")
 
 
 def main():

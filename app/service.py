@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import re
 import threading
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 MAX_EVENT_BYTES = 4096
@@ -120,14 +120,21 @@ def event_from_row(row):
     return event
 
 
-def database_get_events(config):
+def database_get_events(config, device_id=None):
     with database_connection(config) as connection:
         with connection.cursor() as cursor:
             prepare_events_table(cursor)
-            cursor.execute(
+            query = (
                 "SELECT event_id, device_id, observed_at, event_type, note, received_at "
-                "FROM events ORDER BY received_at DESC, event_id LIMIT 50"
+                "FROM events"
             )
+            if device_id is None:
+                cursor.execute(query + " ORDER BY received_at DESC, event_id LIMIT 50")
+            else:
+                cursor.execute(
+                    query + " WHERE device_id = %s ORDER BY received_at DESC, event_id LIMIT 50",
+                    (device_id,),
+                )
             rows = cursor.fetchall()
     return [event_from_row(row) for row in rows]
 
@@ -273,15 +280,40 @@ def make_server(version_file, port=8080, auth_file=None):
             if path == "/events":
                 if not self.require_role("operator"):
                     return
+                try:
+                    query = parse_qs(
+                        urlsplit(self.path).query,
+                        keep_blank_values=True,
+                        strict_parsing=True,
+                    )
+                except ValueError:
+                    self.send_error_json(400, "invalid_query", "query")
+                    return
+                if set(query) - {"device_id"}:
+                    self.send_error_json(400, "invalid_query", "query")
+                    return
+                device_ids = query.get("device_id", [])
+                if len(device_ids) > 1 or (device_ids and not DEVICE_ID_PATTERN.fullmatch(device_ids[0])):
+                    self.send_error_json(400, "invalid_format", "device_id")
+                    return
+                device_id = device_ids[0] if device_ids else None
                 if database_config is not None:
                     try:
-                        latest = database_get_events(database_config)
+                        latest = database_get_events(database_config, device_id)
                     except DatabaseUnavailable:
                         self.send_error_json(503, "database_unavailable", "database")
                         return
                 else:
                     with events_lock:
-                        latest = list(events.values())[-50:][::-1]
+                        latest = [
+                            event for event in events.values()
+                            if device_id is None or event["device_id"] == device_id
+                        ]
+                    latest.sort(
+                        key=lambda event: (event["received_at"], event["event_id"]),
+                        reverse=True,
+                    )
+                    latest = latest[:50]
                 self.send_json(200, {"events": latest})
                 return
             if path.startswith("/events/"):
@@ -367,20 +399,24 @@ li{padding:.8rem 0;border-bottom:1px solid #ccd5da;overflow-wrap:anywhere}pre{wh
 #message{min-height:1.5em}
 </style></head><body><main><h1>巡檢事件</h1>
 <form id="load-form"><label for="operator-token">Operator 權杖</label><input id="operator-token" type="password" autocomplete="off" required>
+<label for="device-id">設備編號</label><input id="device-id" type="text" autocomplete="off">
 <button type="submit">讀取事件</button></form><p id="message" role="status"></p><ol id="events"></ol>
 <script>
 const form=document.querySelector('#load-form');
 const tokenInput=document.querySelector('#operator-token');
+const deviceInput=document.querySelector('#device-id');
 const message=document.querySelector('#message');
 const list=document.querySelector('#events');
 form.addEventListener('submit',async(event)=>{
   event.preventDefault();
   const token=tokenInput.value;
+  const deviceId=deviceInput.value.trim();
   tokenInput.value='';
   message.textContent='讀取中…';
   list.replaceChildren();
   try{
-    const response=await fetch('/events',{headers:{Authorization:'Bearer '+token}});
+    const path=deviceId?'/events?device_id='+encodeURIComponent(deviceId):'/events';
+    const response=await fetch(path,{headers:{Authorization:'Bearer '+token}});
     const data=await response.json();
     if(!response.ok){message.textContent=data.error||'讀取失敗';return;}
     message.textContent='共 '+data.events.length+' 筆';

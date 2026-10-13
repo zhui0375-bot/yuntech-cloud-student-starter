@@ -82,8 +82,10 @@ class FakeCursor:
             self.result = self.database.rows.get(parameters[0])
             return
         if "ORDER BY received_at DESC" in statement:
-            self.result = sorted(self.database.rows.values(),
-                                 key=lambda row: row[5], reverse=True)[:50]
+            rows = self.database.rows.values()
+            if "WHERE device_id = %s" in statement:
+                rows = [row for row in rows if row[1] == parameters[0]]
+            self.result = sorted(rows, key=lambda row: row[5], reverse=True)[:50]
             return
         raise AssertionError("unexpected SQL statement")
 
@@ -204,6 +206,86 @@ class W05DatabaseContract(unittest.TestCase):
         self.assertEqual((status, body), (
             503, {"error": "database_unavailable", "field": "database"}))
         self.assertNotIn("must-not-be-returned", json.dumps(body))
+
+    def test_device_filter_is_operator_only_parameterized_and_limited_to_matching_events(self):
+        for event_id, device_id in (
+            ("group5-ww-w6-a1", "group5-ww-d01"),
+            ("group5-ww-w6-b1", "group5-ww-d02"),
+            ("group5-ww-w6-a2", "group5-ww-d01"),
+        ):
+            event = {
+                "event_id": event_id,
+                "device_id": device_id,
+                "observed_at": "2026-10-13T01:00:00+00:00",
+                "type": "status",
+            }
+            self.assertEqual(
+                self.request("POST", "/events", "reporter-test-token", event)[0],
+                201,
+            )
+
+        status, listing = self.request(
+            "GET", "/events?device_id=group5-ww-d01", "operator-test-token")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [event["event_id"] for event in listing["events"]],
+            ["group5-ww-w6-a2", "group5-ww-w6-a1"],
+        )
+        filtered_query = next(
+            (statement, params) for statement, params in self.database.statements
+            if "WHERE device_id = %s" in statement
+        )
+        self.assertEqual(filtered_query[1], ("group5-ww-d01",))
+        self.assertIn("ORDER BY received_at DESC", filtered_query[0])
+        self.assertIn("LIMIT 50", filtered_query[0])
+
+        self.assertEqual(
+            self.request("GET", "/events?device_id=group5-ww-d01")[0],
+            401,
+        )
+        self.assertEqual(
+            self.request("GET", "/events?device_id=group5-ww-d01",
+                         "reporter-test-token")[0],
+            403,
+        )
+        self.assertEqual(
+            self.request("GET", "/events?device_id=bad%0Avalue",
+                         "operator-test-token"),
+            (400, {"error": "invalid_format", "field": "device_id"}),
+        )
+
+    def test_display_page_uses_filter_query_and_text_content(self):
+        with urllib.request.urlopen(self.base + "/") as response:
+            page = response.read().decode("utf-8")
+        self.assertIn('id="device-id"', page)
+        self.assertIn("encodeURIComponent(deviceId)", page)
+        self.assertIn("content.textContent=JSON.stringify(item,null,2)", page)
+
+    def test_device_filter_works_with_in_memory_store(self):
+        self.stop_server()
+        with patch.object(service, "read_database_config", return_value=None):
+            self.start_server()
+        for event_id, device_id in (
+            ("group5-ww-memory-a", "group5-ww-d01"),
+            ("group5-ww-memory-b", "group5-ww-d02"),
+        ):
+            event = {
+                "event_id": event_id,
+                "device_id": device_id,
+                "observed_at": "2026-10-13T01:00:00+00:00",
+                "type": "status",
+            }
+            self.assertEqual(
+                self.request("POST", "/events", "reporter-test-token", event)[0],
+                201,
+            )
+        status, listing = self.request(
+            "GET", "/events?device_id=group5-ww-d01", "operator-test-token")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [event["event_id"] for event in listing["events"]],
+            ["group5-ww-memory-a"],
+        )
 
 
 if __name__ == "__main__":
