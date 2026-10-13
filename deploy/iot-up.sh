@@ -37,6 +37,21 @@ def stop(message):
     raise SystemExit(message)
 
 
+def approve(description, token):
+    print(description, file=sys.stderr, flush=True)
+    try:
+        terminal = open("/dev/tty", "r+", encoding="utf-8")
+    except OSError as error:
+        raise lab.LabError(
+            "Interactive approval requires a terminal; no IoT resources were changed."
+        ) from error
+    with terminal:
+        terminal.write(f"Type exactly {token} to proceed: ")
+        terminal.flush()
+        if terminal.readline().strip() != token:
+            stop("Cancelled; no IoT resources were changed")
+
+
 def resources():
     if RESOURCE_FILE.is_symlink() or not RESOURCE_FILE.is_file():
         stop("Missing or unsafe .local/resources.json; refusing IoT provisioning")
@@ -304,7 +319,7 @@ def main():
         "policy names in .local/resources.json, revoke only these two certificates and delete only "
         "the matching cxe-group5-ww-gw and cxe-group5-ww-consumer policies."
     )
-    lab.approve(plan, "CREATE-IOT")
+    approve(plan, "CREATE-IOT")
     secure_iot_dir()
     lock_descriptor = acquire_lock()
 
