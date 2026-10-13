@@ -273,10 +273,13 @@ def install_iot_file(public_ip, key_path, name, content):
         raise ValueError("Unsupported W6 IoT deployment file")
     remote_path = f"/etc/inspection/iot/{name}"
     remote_command = (
-        "sudo sh -c 'umask 077; "
+        "sudo sh -c 'set -eu; umask 077; "
         "install -d -o inspection -g inspection -m 700 /etc/inspection/iot; "
-        f"cat > {remote_path}; "
-        f"chown inspection:inspection {remote_path}; chmod 600 {remote_path}'"
+        "temporary=$(mktemp /etc/inspection/iot/.w6-install.XXXXXX); "
+        "trap \"rm -f \\\"$temporary\\\"\" EXIT; "
+        "cat > \"$temporary\"; "
+        "chown inspection:inspection \"$temporary\"; chmod 600 \"$temporary\"; "
+        f"mv -fT -- \"$temporary\" {remote_path}; trap - EXIT'"
     )
     run_ssh(public_ip, key_path, remote_command, content)
 
@@ -336,11 +339,12 @@ IoT：安裝一張已核對的 consumer 憑證、私鑰與 Root CA 到 /etc/insp
                        cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         run_ssh(public_ip, key_path, "sudo bash -s", user_data.read_bytes())
     install_secret = (
-        "sudo sh -c 'umask 077; install -d -o root -g root -m 755 /etc/inspection; "
+        "sudo sh -c 'set -eu; umask 077; install -d -o root -g root -m 755 /etc/inspection; "
         "chown root:root /etc/inspection; chmod 755 /etc/inspection; "
         "cat > /etc/inspection/app.env; chown root:root /etc/inspection/app.env; "
         "chmod 600 /etc/inspection/app.env'"
     )
+    run_ssh(public_ip, key_path, "sudo systemctl stop inspection-consumer.service")
     for name, content in iot_files.items():
         install_iot_file(public_ip, key_path, name, content)
     run_ssh(public_ip, key_path, install_secret, deployment_secrets)

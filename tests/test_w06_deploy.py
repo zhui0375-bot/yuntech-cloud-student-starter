@@ -81,10 +81,13 @@ class W06DeploymentTests(unittest.TestCase):
         with patch.object(w04_ops, "run_ssh") as run_ssh:
             w04_ops.install_iot_file("192.0.2.10", Path("/tmp/key"), "consumer.private.key", b"key")
         remote_command = run_ssh.call_args.args[2]
+        self.assertIn("set -eu", remote_command)
         self.assertIn("umask 077", remote_command)
         self.assertIn("install -d -o inspection -g inspection -m 700", remote_command)
         self.assertIn("chown inspection:inspection", remote_command)
         self.assertIn("chmod 600", remote_command)
+        self.assertIn("mktemp", remote_command)
+        self.assertIn("mv -fT", remote_command)
         self.assertEqual(run_ssh.call_args.args[3], b"key")
         with self.assertRaisesRegex(ValueError, "Unsupported"):
             w04_ops.install_iot_file("192.0.2.10", Path("/tmp/key"), "unexpected", b"")
