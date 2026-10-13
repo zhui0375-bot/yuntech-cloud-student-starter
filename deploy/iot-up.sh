@@ -40,15 +40,16 @@ def stop(message):
 def approve(description, token):
     print(description, file=sys.stderr, flush=True)
     try:
-        terminal = open("/dev/tty", "r+", encoding="utf-8")
+        terminal_input = open("/dev/tty", "r", encoding="utf-8")
+        terminal_output = open("/dev/tty", "w", encoding="utf-8")
     except OSError as error:
         raise lab.LabError(
             "Interactive approval requires a terminal; no IoT resources were changed."
         ) from error
-    with terminal:
-        terminal.write(f"Type exactly {token} to proceed: ")
-        terminal.flush()
-        if terminal.readline().strip() != token:
+    with terminal_input, terminal_output:
+        terminal_output.write(f"Type exactly {token} to proceed: ")
+        terminal_output.flush()
+        if terminal_input.readline().strip() != token:
             stop("Cancelled; no IoT resources were changed")
 
 
